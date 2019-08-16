@@ -5,23 +5,25 @@ use crate::{
     http::{login_credentials, login_session, logout},
 };
 use actix::{prelude::*, SystemRunner};
+use actix_cors::Cors;
+use actix_files::Files;
 use actix_web::{
-    fs::StaticFiles,
-    http::{
-        self,
-        header::{CONTENT_TYPE, LOCATION},
-        NormalizePath,
-    },
-    middleware::{self, cors::Cors},
-    server, App, HttpResponse,
+    http::header::{CONTENT_TYPE, LOCATION},
+    middleware,
+    web::{get, post, resource},
+    App, HttpResponse, HttpServer,
 };
 use diesel::{prelude::*, r2d2::ConnectionManager};
-use failure::Fallible;
+use failure::{format_err, Fallible};
 use log::{info, warn};
 use num_cpus;
 use openssl::ssl::{SslAcceptor, SslAcceptorBuilder, SslFiletype, SslMethod};
 use r2d2::Pool;
-use std::thread;
+use std::{
+    net::{SocketAddr, ToSocketAddrs},
+    slice::from_ref,
+    thread,
+};
 use url::Url;
 use webapp::{config::Config, API_URL_LOGIN_CREDENTIALS, API_URL_LOGIN_SESSION, API_URL_LOGOUT};
 
@@ -32,15 +34,6 @@ pub struct Server {
     config: Config,
     runner: SystemRunner,
     url: Url,
-}
-
-/// Shared mutable application state
-pub struct State<T>
-where
-    T: Actor,
-{
-    /// The database connection
-    pub database: Addr<T>,
 }
 
 impl Server {
@@ -62,40 +55,35 @@ impl Server {
         let db_addr = SyncArbiter::start(num_cpus::get(), move || DatabaseExecutor(pool.clone()));
 
         // Create the server
-        let server = server::new(move || {
-            App::with_state(State {
-                database: db_addr.clone(),
-            })
-            .middleware(middleware::Logger::default())
-            .configure(|app| {
-                Cors::for_app(app)
-                    .allowed_methods(vec!["GET", "POST"])
-                    .allowed_header(CONTENT_TYPE)
-                    .max_age(3600)
-                    .resource(API_URL_LOGIN_CREDENTIALS, |r| {
-                        r.method(http::Method::POST).f(login_credentials)
-                    })
-                    .resource(API_URL_LOGIN_SESSION, |r| {
-                        r.method(http::Method::POST).f(login_session)
-                    })
-                    .resource(API_URL_LOGOUT, |r| r.method(http::Method::POST).f(logout))
-                    .register()
-            })
-            .default_resource(|r| r.h(NormalizePath::default()))
-            .handler(
-                "/",
-                StaticFiles::new("static").unwrap().index_file("index.html"),
-            )
+        let server = HttpServer::new(move || {
+            App::new()
+                .data(db_addr.clone())
+                .wrap(
+                    Cors::new()
+                        .allowed_methods(vec!["GET", "POST"])
+                        .allowed_header(CONTENT_TYPE)
+                        .max_age(3600),
+                )
+                .wrap(middleware::Logger::default())
+                .service(
+                    resource(API_URL_LOGIN_CREDENTIALS).route(post().to_async(login_credentials)),
+                )
+                .service(resource(API_URL_LOGIN_SESSION).route(post().to_async(login_session)))
+                .service(resource(API_URL_LOGOUT).route(post().to_async(logout)))
+                .service(Files::new("/", "./static/").index_file("index.html"))
         });
 
         // Create the server url from the given configuration
         let url = Url::parse(&config.server.url)?;
 
         // Bind the address
+        let addrs = Self::url_to_socket_addrs(&url)?;
         if url.scheme() == "https" {
-            server.bind_ssl(&url, Self::build_tls(&config)?)?.start();
+            server
+                .bind_ssl(addrs.as_slice(), Self::build_tls(&config)?)?
+                .start();
         } else {
-            server.bind(&url)?.start();
+            server.bind(addrs.as_slice())?.start();
         }
 
         Ok(Server {
@@ -106,12 +94,14 @@ impl Server {
     }
 
     /// Start the server
-    pub fn start(self) -> i32 {
+    pub fn start(self) -> Fallible<()> {
         // Start the redirecting server
         self.start_redirects();
 
         // Start the actual main server
-        self.runner.run()
+        self.runner.run()?;
+
+        Ok(())
     }
 
     /// Build an SslAcceptorBuilder from a config
@@ -136,15 +126,13 @@ impl Server {
                 let url = server_url.clone();
 
                 // Create redirecting server
-                let mut server = server::new(move || {
+                let mut server = HttpServer::new(move || {
                     let location = url.clone();
-                    App::new().default_resource(|r| {
-                        r.f(move |_| {
-                            HttpResponse::PermanentRedirect()
-                                .header(LOCATION, location.as_str())
-                                .finish()
-                        })
-                    })
+                    App::new().service(resource("/").route(get().to(move || {
+                        HttpResponse::PermanentRedirect()
+                            .header(LOCATION, location.as_str())
+                            .finish()
+                    })))
                 });
 
                 // Bind the URLs if possible
@@ -154,14 +142,15 @@ impl Server {
                             "Starting server to redirect from {} to {}",
                             valid_url, server_url
                         );
+                        let addrs = Self::url_to_socket_addrs(&valid_url).unwrap();
                         if valid_url.scheme() == "https" {
                             if let Ok(tls) = Self::build_tls(&config_clone) {
-                                server = server.bind_ssl(&valid_url, tls).unwrap();
+                                server = server.bind_ssl(addrs.as_slice(), tls).unwrap();
                             } else {
                                 warn!("Unable to build TLS acceptor for server: {}", valid_url);
                             }
                         } else {
-                            server = server.bind(&valid_url).unwrap();
+                            server = server.bind(addrs.as_slice()).unwrap();
                         }
                     } else {
                         warn!("Skipping invalid url: {}", url);
@@ -170,8 +159,34 @@ impl Server {
 
                 // Start the server and the system
                 server.start();
-                system.run();
+                system.run().unwrap();
             });
         }
+    }
+
+    /// Convert an `Url` to a vector of `SocketAddr`
+    pub fn url_to_socket_addrs(url: &Url) -> Fallible<Vec<SocketAddr>> {
+        let host = url
+            .host()
+            .ok_or_else(|| format_err!("No host name in the URL"))?;
+        let port = url
+            .port_or_known_default()
+            .ok_or_else(|| format_err!("No port number in the URL"))?;
+        let addrs;
+        let addr;
+        Ok(match host {
+            url::Host::Domain(domain) => {
+                addrs = (domain, port).to_socket_addrs()?;
+                addrs.as_slice().to_owned()
+            }
+            url::Host::Ipv4(ip) => {
+                addr = (ip, port).into();
+                from_ref(&addr).to_owned()
+            }
+            url::Host::Ipv6(ip) => {
+                addr = (ip, port).into();
+                from_ref(&addr).to_owned()
+            }
+        })
     }
 }
